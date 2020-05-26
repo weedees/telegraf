@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -56,6 +56,10 @@ var (
 // will be logging to, as well as all the plugins that the user has
 // specified
 type Config struct {
+	toml         *toml.Config
+	errs         []error // config load errors.
+	UnusedFields map[string]bool
+
 	Tags          map[string]string
 	InputFilters  []string
 	OutputFilters []string
@@ -68,8 +72,13 @@ type Config struct {
 	Processors models.RunningProcessors
 }
 
+// NewConfig creates a new struct to hold the Telegraf config.
+// For historical reasons, It holds the actual instances of the running plugins
+// once the configuration is parsed.
 func NewConfig() *Config {
 	c := &Config{
+		UnusedFields: map[string]bool{},
+
 		// Agent defaults:
 		Agent: &AgentConfig{
 			Interval:                   internal.Duration{Duration: 10 * time.Second},
@@ -86,6 +95,14 @@ func NewConfig() *Config {
 		InputFilters:  make([]string, 0),
 		OutputFilters: make([]string, 0),
 	}
+
+	tomlCfg := &toml.Config{
+		NormFieldName: toml.DefaultConfig.NormFieldName,
+		FieldToKey:    toml.DefaultConfig.FieldToKey,
+		MissingField:  c.missingTomlField,
+	}
+	c.toml = tomlCfg
+
 	return c
 }
 
@@ -699,9 +716,9 @@ func (c *Config) LoadConfig(path string) error {
 			if !ok {
 				return fmt.Errorf("%s: invalid configuration", path)
 			}
-			if err = toml.UnmarshalTable(subTable, c.Tags); err != nil {
+			if err = c.toml.UnmarshalTable(subTable, c.Tags); err != nil {
 				log.Printf("E! Could not parse [global_tags] config\n")
-				return fmt.Errorf("Error parsing %s, %s", path, err)
+				return fmt.Errorf("Error parsing table name %q: %s", tableName, err)
 			}
 		}
 	}
@@ -712,7 +729,7 @@ func (c *Config) LoadConfig(path string) error {
 		if !ok {
 			return fmt.Errorf("%s: invalid configuration", path)
 		}
-		if err = toml.UnmarshalTable(subTable, c.Agent); err != nil {
+		if err = c.toml.UnmarshalTable(subTable, c.Agent); err != nil {
 			log.Printf("E! Could not parse [agent] config\n")
 			return fmt.Errorf("Error parsing %s, %s", path, err)
 		}
@@ -729,6 +746,10 @@ func (c *Config) LoadConfig(path string) error {
 		}
 
 		c.Tags["host"] = c.Agent.Hostname
+	}
+
+	if len(c.UnusedFields) > 0 {
+		return fmt.Errorf("Error parsing %s: Configuration specified the fields %q, but they weren't used.", path, keys(c.UnusedFields))
 	}
 
 	// Parse all the rest of the plugins:
@@ -758,6 +779,9 @@ func (c *Config) LoadConfig(path string) error {
 					return fmt.Errorf("Unsupported config format: %s, file %s",
 						pluginName, path)
 				}
+				if len(c.UnusedFields) > 0 {
+					return fmt.Errorf("Error parsing %s: plugin %s.%s: Configuration specified the fields %q, but they weren't used.", path, name, pluginName, keys(c.UnusedFields))
+				}
 			}
 		case "inputs", "plugins":
 			for pluginName, pluginVal := range subTable.Fields {
@@ -777,6 +801,9 @@ func (c *Config) LoadConfig(path string) error {
 					return fmt.Errorf("Unsupported config format: %s, file %s",
 						pluginName, path)
 				}
+				if len(c.UnusedFields) > 0 {
+					return fmt.Errorf("Error parsing %s: plugin %s.%s: Configuration specified the fields %q, but they weren't used.", path, name, pluginName, keys(c.UnusedFields))
+				}
 			}
 		case "processors":
 			for pluginName, pluginVal := range subTable.Fields {
@@ -791,6 +818,9 @@ func (c *Config) LoadConfig(path string) error {
 					return fmt.Errorf("Unsupported config format: %s, file %s",
 						pluginName, path)
 				}
+				if len(c.UnusedFields) > 0 {
+					return fmt.Errorf("Error parsing %s: plugin %s.%s: Configuration specified the fields %q, but they weren't used.", path, name, pluginName, keys(c.UnusedFields))
+				}
 			}
 		case "aggregators":
 			for pluginName, pluginVal := range subTable.Fields {
@@ -804,6 +834,9 @@ func (c *Config) LoadConfig(path string) error {
 				default:
 					return fmt.Errorf("Unsupported config format: %s, file %s",
 						pluginName, path)
+				}
+				if len(c.UnusedFields) > 0 {
+					return fmt.Errorf("Error parsing %s: plugin %s.%s: Configuration specified the fields %q, but they weren't used.", path, name, pluginName, keys(c.UnusedFields))
 				}
 			}
 		// Assume it's an input input for legacy config file support if no other
@@ -911,12 +944,12 @@ func (c *Config) addAggregator(name string, table *ast.Table) error {
 	}
 	aggregator := creator()
 
-	conf, err := buildAggregator(name, table)
+	conf, err := c.buildAggregator(name, table)
 	if err != nil {
 		return err
 	}
 
-	if err := toml.UnmarshalTable(table, aggregator); err != nil {
+	if err := c.toml.UnmarshalTable(table, aggregator); err != nil {
 		return err
 	}
 
@@ -931,12 +964,12 @@ func (c *Config) addProcessor(name string, table *ast.Table) error {
 	}
 	processor := creator()
 
-	processorConfig, err := buildProcessor(name, table)
+	processorConfig, err := c.buildProcessor(name, table)
 	if err != nil {
 		return err
 	}
 
-	if err := toml.UnmarshalTable(table, processor); err != nil {
+	if err := c.toml.UnmarshalTable(table, processor); err != nil {
 		return err
 	}
 
@@ -960,19 +993,19 @@ func (c *Config) addOutput(name string, table *ast.Table) error {
 	// arbitrary types of output, so build the serializer and set it.
 	switch t := output.(type) {
 	case serializers.SerializerOutput:
-		serializer, err := buildSerializer(name, table)
+		serializer, err := c.buildSerializer(name, table)
 		if err != nil {
 			return err
 		}
 		t.SetSerializer(serializer)
 	}
 
-	outputConfig, err := buildOutput(name, table)
+	outputConfig, err := c.buildOutput(name, table)
 	if err != nil {
 		return err
 	}
 
-	if err := toml.UnmarshalTable(table, output); err != nil {
+	if err := c.toml.UnmarshalTable(table, output); err != nil {
 		return err
 	}
 
@@ -1001,7 +1034,7 @@ func (c *Config) addInput(name string, table *ast.Table) error {
 	// arbitrary types of input, so build the parser and set it.
 	switch t := input.(type) {
 	case parsers.ParserInput:
-		parser, err := buildParser(name, table)
+		parser, err := c.buildParser(name, table)
 		if err != nil {
 			return err
 		}
@@ -1010,7 +1043,7 @@ func (c *Config) addInput(name string, table *ast.Table) error {
 
 	switch t := input.(type) {
 	case parsers.ParserFuncInput:
-		config, err := getParserConfig(name, table)
+		config, err := c.getParserConfig(name, table)
 		if err != nil {
 			return err
 		}
@@ -1019,12 +1052,12 @@ func (c *Config) addInput(name string, table *ast.Table) error {
 		})
 	}
 
-	pluginConfig, err := buildInput(name, table)
+	pluginConfig, err := c.buildInput(name, table)
 	if err != nil {
 		return err
 	}
 
-	if err := toml.UnmarshalTable(table, input); err != nil {
+	if err := c.toml.UnmarshalTable(table, input); err != nil {
 		return err
 	}
 
@@ -1037,7 +1070,7 @@ func (c *Config) addInput(name string, table *ast.Table) error {
 // buildAggregator parses Aggregator specific items from the ast.Table,
 // builds the filter and returns a
 // models.AggregatorConfig to be inserted into models.RunningAggregator
-func buildAggregator(name string, tbl *ast.Table) (*models.AggregatorConfig, error) {
+func (c *Config) buildAggregator(name string, tbl *ast.Table) (*models.AggregatorConfig, error) {
 	conf := &models.AggregatorConfig{
 		Name:   name,
 		Delay:  time.Millisecond * 100,
@@ -1045,108 +1078,30 @@ func buildAggregator(name string, tbl *ast.Table) (*models.AggregatorConfig, err
 		Grace:  time.Second * 0,
 	}
 
-	if node, ok := tbl.Fields["period"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				dur, err := time.ParseDuration(str.Value)
-				if err != nil {
-					return nil, err
-				}
-
-				conf.Period = dur
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["delay"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				dur, err := time.ParseDuration(str.Value)
-				if err != nil {
-					return nil, err
-				}
-
-				conf.Delay = dur
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["grace"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				dur, err := time.ParseDuration(str.Value)
-				if err != nil {
-					return nil, err
-				}
-
-				conf.Grace = dur
-			}
-		}
-	}
-	if node, ok := tbl.Fields["drop_original"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				conf.DropOriginal, err = strconv.ParseBool(b.Value)
-				if err != nil {
-					log.Printf("Error parsing boolean value for %s: %s\n", name, err)
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_prefix"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				conf.MeasurementPrefix = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_suffix"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				conf.MeasurementSuffix = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_override"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				conf.NameOverride = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["alias"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				conf.Alias = str.Value
-			}
-		}
-	}
+	c.getFieldDuration(tbl, "period", &conf.Period)
+	c.getFieldDuration(tbl, "delay", &conf.Delay)
+	c.getFieldDuration(tbl, "grace", &conf.Grace)
+	c.getFieldBool(tbl, "drop_original", &conf.DropOriginal)
+	c.getFieldString(tbl, "name_prefix", &conf.MeasurementPrefix)
+	c.getFieldString(tbl, "name_suffix", &conf.MeasurementSuffix)
+	c.getFieldString(tbl, "name_override", &conf.NameOverride)
+	c.getFieldString(tbl, "alias", &conf.Alias)
 
 	conf.Tags = make(map[string]string)
 	if node, ok := tbl.Fields["tags"]; ok {
 		if subtbl, ok := node.(*ast.Table); ok {
-			if err := toml.UnmarshalTable(subtbl, conf.Tags); err != nil {
+			if err := c.toml.UnmarshalTable(subtbl, conf.Tags); err != nil {
 				log.Printf("Could not parse tags for input %s\n", name)
 			}
 		}
 	}
 
-	delete(tbl.Fields, "period")
-	delete(tbl.Fields, "delay")
-	delete(tbl.Fields, "grace")
-	delete(tbl.Fields, "drop_original")
-	delete(tbl.Fields, "name_prefix")
-	delete(tbl.Fields, "name_suffix")
-	delete(tbl.Fields, "name_override")
-	delete(tbl.Fields, "alias")
-	delete(tbl.Fields, "tags")
+	if c.hasErrs() {
+		return nil, c.firstErr()
+	}
+
 	var err error
-	conf.Filter, err = buildFilter(tbl)
+	conf.Filter, err = c.buildFilter(tbl)
 	if err != nil {
 		return conf, err
 	}
@@ -1156,33 +1111,18 @@ func buildAggregator(name string, tbl *ast.Table) (*models.AggregatorConfig, err
 // buildProcessor parses Processor specific items from the ast.Table,
 // builds the filter and returns a
 // models.ProcessorConfig to be inserted into models.RunningProcessor
-func buildProcessor(name string, tbl *ast.Table) (*models.ProcessorConfig, error) {
+func (c *Config) buildProcessor(name string, tbl *ast.Table) (*models.ProcessorConfig, error) {
 	conf := &models.ProcessorConfig{Name: name}
 
-	if node, ok := tbl.Fields["order"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Integer); ok {
-				var err error
-				conf.Order, err = strconv.ParseInt(b.Value, 10, 64)
-				if err != nil {
-					log.Printf("Error parsing int value for %s: %s\n", name, err)
-				}
-			}
-		}
+	c.getFieldInt64(tbl, "order", &conf.Order)
+	c.getFieldString(tbl, "alias", &conf.Alias)
+
+	if c.hasErrs() {
+		return nil, c.firstErr()
 	}
 
-	if node, ok := tbl.Fields["alias"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				conf.Alias = str.Value
-			}
-		}
-	}
-
-	delete(tbl.Fields, "alias")
-	delete(tbl.Fields, "order")
 	var err error
-	conf.Filter, err = buildFilter(tbl)
+	conf.Filter, err = c.buildFilter(tbl)
 	if err != nil {
 		return conf, err
 	}
@@ -1193,62 +1133,17 @@ func buildProcessor(name string, tbl *ast.Table) (*models.ProcessorConfig, error
 // (tagpass/tagdrop/namepass/namedrop/fieldpass/fielddrop) to
 // be inserted into the models.OutputConfig/models.InputConfig
 // to be used for glob filtering on tags and measurements
-func buildFilter(tbl *ast.Table) (models.Filter, error) {
+func (c *Config) buildFilter(tbl *ast.Table) (models.Filter, error) {
 	f := models.Filter{}
 
-	if node, ok := tbl.Fields["namepass"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						f.NamePass = append(f.NamePass, str.Value)
-					}
-				}
-			}
-		}
-	}
+	c.getFieldStringSlice(tbl, "namepass", &f.NamePass)
+	c.getFieldStringSlice(tbl, "namedrop", &f.NameDrop)
 
-	if node, ok := tbl.Fields["namedrop"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						f.NameDrop = append(f.NameDrop, str.Value)
-					}
-				}
-			}
-		}
-	}
+	c.getFieldStringSlice(tbl, "pass", &f.FieldPass)
+	c.getFieldStringSlice(tbl, "fieldpass", &f.FieldPass)
 
-	fields := []string{"pass", "fieldpass"}
-	for _, field := range fields {
-		if node, ok := tbl.Fields[field]; ok {
-			if kv, ok := node.(*ast.KeyValue); ok {
-				if ary, ok := kv.Value.(*ast.Array); ok {
-					for _, elem := range ary.Value {
-						if str, ok := elem.(*ast.String); ok {
-							f.FieldPass = append(f.FieldPass, str.Value)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	fields = []string{"drop", "fielddrop"}
-	for _, field := range fields {
-		if node, ok := tbl.Fields[field]; ok {
-			if kv, ok := node.(*ast.KeyValue); ok {
-				if ary, ok := kv.Value.(*ast.Array); ok {
-					for _, elem := range ary.Value {
-						if str, ok := elem.(*ast.String); ok {
-							f.FieldDrop = append(f.FieldDrop, str.Value)
-						}
-					}
-				}
-			}
-		}
-	}
+	c.getFieldStringSlice(tbl, "drop", &f.FieldDrop)
+	c.getFieldStringSlice(tbl, "fielddrop", &f.FieldDrop)
 
 	if node, ok := tbl.Fields["tagpass"]; ok {
 		if subtbl, ok := node.(*ast.Table); ok {
@@ -1286,113 +1181,46 @@ func buildFilter(tbl *ast.Table) (models.Filter, error) {
 		}
 	}
 
-	if node, ok := tbl.Fields["tagexclude"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						f.TagExclude = append(f.TagExclude, str.Value)
-					}
-				}
-			}
-		}
+	c.getFieldStringSlice(tbl, "tagexclude", &f.TagExclude)
+	c.getFieldStringSlice(tbl, "taginclude", &f.TagInclude)
+
+	if c.hasErrs() {
+		return f, c.firstErr()
 	}
 
-	if node, ok := tbl.Fields["taginclude"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						f.TagInclude = append(f.TagInclude, str.Value)
-					}
-				}
-			}
-		}
-	}
 	if err := f.Compile(); err != nil {
 		return f, err
 	}
 
-	delete(tbl.Fields, "namedrop")
-	delete(tbl.Fields, "namepass")
-	delete(tbl.Fields, "fielddrop")
-	delete(tbl.Fields, "fieldpass")
-	delete(tbl.Fields, "drop")
-	delete(tbl.Fields, "pass")
-	delete(tbl.Fields, "tagdrop")
-	delete(tbl.Fields, "tagpass")
-	delete(tbl.Fields, "tagexclude")
-	delete(tbl.Fields, "taginclude")
 	return f, nil
 }
 
 // buildInput parses input specific items from the ast.Table,
 // builds the filter and returns a
 // models.InputConfig to be inserted into models.RunningInput
-func buildInput(name string, tbl *ast.Table) (*models.InputConfig, error) {
+func (c *Config) buildInput(name string, tbl *ast.Table) (*models.InputConfig, error) {
 	cp := &models.InputConfig{Name: name}
-	if node, ok := tbl.Fields["interval"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				dur, err := time.ParseDuration(str.Value)
-				if err != nil {
-					return nil, err
-				}
-
-				cp.Interval = dur
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_prefix"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				cp.MeasurementPrefix = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_suffix"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				cp.MeasurementSuffix = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_override"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				cp.NameOverride = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["alias"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				cp.Alias = str.Value
-			}
-		}
-	}
+	c.getFieldDuration(tbl, "interval", &cp.Interval)
+	c.getFieldString(tbl, "name_prefix", &cp.MeasurementPrefix)
+	c.getFieldString(tbl, "name_suffix", &cp.MeasurementSuffix)
+	c.getFieldString(tbl, "name_override", &cp.NameOverride)
+	c.getFieldString(tbl, "alias", &cp.Alias)
 
 	cp.Tags = make(map[string]string)
 	if node, ok := tbl.Fields["tags"]; ok {
 		if subtbl, ok := node.(*ast.Table); ok {
-			if err := toml.UnmarshalTable(subtbl, cp.Tags); err != nil {
+			if err := c.toml.UnmarshalTable(subtbl, cp.Tags); err != nil {
 				log.Printf("E! Could not parse tags for input %s\n", name)
 			}
 		}
 	}
 
-	delete(tbl.Fields, "name_prefix")
-	delete(tbl.Fields, "name_suffix")
-	delete(tbl.Fields, "name_override")
-	delete(tbl.Fields, "alias")
-	delete(tbl.Fields, "interval")
-	delete(tbl.Fields, "tags")
+	if c.hasErrs() {
+		return nil, c.firstErr()
+	}
+
 	var err error
-	cp.Filter, err = buildFilter(tbl)
+	cp.Filter, err = c.buildFilter(tbl)
 	if err != nil {
 		return cp, err
 	}
@@ -1402,689 +1230,132 @@ func buildInput(name string, tbl *ast.Table) (*models.InputConfig, error) {
 // buildParser grabs the necessary entries from the ast.Table for creating
 // a parsers.Parser object, and creates it, which can then be added onto
 // an Input object.
-func buildParser(name string, tbl *ast.Table) (parsers.Parser, error) {
-	config, err := getParserConfig(name, tbl)
+func (c *Config) buildParser(name string, tbl *ast.Table) (parsers.Parser, error) {
+	config, err := c.getParserConfig(name, tbl)
 	if err != nil {
 		return nil, err
 	}
 	return parsers.NewParser(config)
 }
 
-func getParserConfig(name string, tbl *ast.Table) (*parsers.Config, error) {
-	c := &parsers.Config{
+func (c *Config) getParserConfig(name string, tbl *ast.Table) (*parsers.Config, error) {
+	pc := &parsers.Config{
 		JSONStrict: true,
 	}
 
-	if node, ok := tbl.Fields["data_format"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.DataFormat = str.Value
-			}
-		}
-	}
+	c.getFieldString(tbl, "data_format", &pc.DataFormat)
 
 	// Legacy support, exec plugin originally parsed JSON by default.
-	if name == "exec" && c.DataFormat == "" {
-		c.DataFormat = "json"
-	} else if c.DataFormat == "" {
-		c.DataFormat = "influx"
+	if name == "exec" && pc.DataFormat == "" {
+		pc.DataFormat = "json"
+	} else if pc.DataFormat == "" {
+		pc.DataFormat = "influx"
 	}
 
-	if node, ok := tbl.Fields["separator"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.Separator = str.Value
-			}
-		}
-	}
+	c.getFieldString(tbl, "separator", &pc.Separator)
 
-	if node, ok := tbl.Fields["templates"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.Templates = append(c.Templates, str.Value)
-					}
-				}
-			}
-		}
-	}
+	c.getFieldStringSlice(tbl, "templates", &pc.Templates)
+	c.getFieldStringSlice(tbl, "tag_keys", &pc.TagKeys)
+	c.getFieldStringSlice(tbl, "json_string_fields", &pc.JSONStringFields)
+	c.getFieldString(tbl, "json_name_key", &pc.JSONNameKey)
+	c.getFieldString(tbl, "json_query", &pc.JSONQuery)
+	c.getFieldString(tbl, "json_time_key", &pc.JSONTimeKey)
+	c.getFieldString(tbl, "json_time_format", &pc.JSONTimeFormat)
+	c.getFieldString(tbl, "json_timezone", &pc.JSONTimezone)
+	c.getFieldBool(tbl, "json_strict", &pc.JSONStrict)
+	c.getFieldString(tbl, "data_type", &pc.DataType)
+	c.getFieldString(tbl, "collectd_auth_file", &pc.CollectdAuthFile)
+	c.getFieldString(tbl, "collectd_security_level", &pc.CollectdSecurityLevel)
+	c.getFieldString(tbl, "collectd_parse_multivalue", &pc.CollectdSplit)
 
-	if node, ok := tbl.Fields["tag_keys"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.TagKeys = append(c.TagKeys, str.Value)
-					}
-				}
-			}
-		}
-	}
+	c.getFieldStringSlice(tbl, "collectd_typesdb", &pc.CollectdTypesDB)
 
-	if node, ok := tbl.Fields["json_string_fields"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.JSONStringFields = append(c.JSONStringFields, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["json_name_key"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.JSONNameKey = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["json_query"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.JSONQuery = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["json_time_key"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.JSONTimeKey = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["json_time_format"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.JSONTimeFormat = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["json_timezone"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.JSONTimezone = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["json_strict"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.JSONStrict, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["data_type"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.DataType = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["collectd_auth_file"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CollectdAuthFile = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["collectd_security_level"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CollectdSecurityLevel = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["collectd_parse_multivalue"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CollectdSplit = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["collectd_typesdb"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.CollectdTypesDB = append(c.CollectdTypesDB, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["dropwizard_metric_registry_path"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.DropwizardMetricRegistryPath = str.Value
-			}
-		}
-	}
-	if node, ok := tbl.Fields["dropwizard_time_path"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.DropwizardTimePath = str.Value
-			}
-		}
-	}
-	if node, ok := tbl.Fields["dropwizard_time_format"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.DropwizardTimeFormat = str.Value
-			}
-		}
-	}
-	if node, ok := tbl.Fields["dropwizard_tags_path"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.DropwizardTagsPath = str.Value
-			}
-		}
-	}
-	c.DropwizardTagPathsMap = make(map[string]string)
-	if node, ok := tbl.Fields["dropwizard_tag_paths"]; ok {
-		if subtbl, ok := node.(*ast.Table); ok {
-			for name, val := range subtbl.Fields {
-				if kv, ok := val.(*ast.KeyValue); ok {
-					if str, ok := kv.Value.(*ast.String); ok {
-						c.DropwizardTagPathsMap[name] = str.Value
-					}
-				}
-			}
-		}
-	}
+	c.getFieldString(tbl, "dropwizard_metric_registry_path", &pc.DropwizardMetricRegistryPath)
+	c.getFieldString(tbl, "dropwizard_time_path", &pc.DropwizardTimePath)
+	c.getFieldString(tbl, "dropwizard_time_format", &pc.DropwizardTimeFormat)
+	c.getFieldString(tbl, "dropwizard_tags_path", &pc.DropwizardTagsPath)
+	c.getFieldStringMap(tbl, "dropwizard_tag_paths", &pc.DropwizardTagPathsMap)
 
 	//for grok data_format
-	if node, ok := tbl.Fields["grok_named_patterns"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.GrokNamedPatterns = append(c.GrokNamedPatterns, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["grok_patterns"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.GrokPatterns = append(c.GrokPatterns, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["grok_custom_patterns"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.GrokCustomPatterns = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["grok_custom_pattern_files"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.GrokCustomPatternFiles = append(c.GrokCustomPatternFiles, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["grok_timezone"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.GrokTimezone = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["grok_unique_timestamp"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.GrokUniqueTimestamp = str.Value
-			}
-		}
-	}
+	c.getFieldStringSlice(tbl, "grok_named_patterns", &pc.GrokNamedPatterns)
+	c.getFieldStringSlice(tbl, "grok_patterns", &pc.GrokPatterns)
+	c.getFieldString(tbl, "grok_custom_patterns", &pc.GrokCustomPatterns)
+	c.getFieldStringSlice(tbl, "grok_custom_pattern_files", &pc.GrokCustomPatternFiles)
+	c.getFieldString(tbl, "grok_timezone", &pc.GrokTimezone)
+	c.getFieldString(tbl, "grok_unique_timestamp", &pc.GrokUniqueTimestamp)
 
 	//for csv parser
-	if node, ok := tbl.Fields["csv_column_names"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.CSVColumnNames = append(c.CSVColumnNames, str.Value)
-					}
-				}
-			}
-		}
+	c.getFieldStringSlice(tbl, "csv_column_names", &pc.CSVColumnNames)
+	c.getFieldStringSlice(tbl, "csv_column_types", &pc.CSVColumnTypes)
+	c.getFieldStringSlice(tbl, "csv_tag_columns", &pc.CSVTagColumns)
+	c.getFieldString(tbl, "csv_delimiter", &pc.CSVDelimiter)
+	c.getFieldString(tbl, "csv_comment", &pc.CSVComment)
+	c.getFieldString(tbl, "csv_measurement_column", &pc.CSVMeasurementColumn)
+	c.getFieldString(tbl, "csv_timestamp_column", &pc.CSVTimestampColumn)
+	c.getFieldString(tbl, "csv_timestamp_format", &pc.CSVTimestampFormat)
+	c.getFieldInt(tbl, "csv_header_row_count", &pc.CSVHeaderRowCount)
+	c.getFieldInt(tbl, "csv_skip_rows", &pc.CSVSkipRows)
+	c.getFieldInt(tbl, "csv_skip_columns", &pc.CSVSkipColumns)
+	c.getFieldBool(tbl, "csv_trim_space", &pc.CSVTrimSpace)
+
+	c.getFieldStringSlice(tbl, "form_urlencoded_tag_keys", &pc.FormUrlencodedTagKeys)
+
+	pc.MetricName = name
+
+	if c.hasErrs() {
+		return nil, c.firstErr()
 	}
 
-	if node, ok := tbl.Fields["csv_column_types"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.CSVColumnTypes = append(c.CSVColumnTypes, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_tag_columns"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.CSVTagColumns = append(c.CSVTagColumns, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_delimiter"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CSVDelimiter = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_comment"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CSVComment = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_measurement_column"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CSVMeasurementColumn = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_timestamp_column"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CSVTimestampColumn = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_timestamp_format"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.CSVTimestampFormat = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_header_row_count"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if integer, ok := kv.Value.(*ast.Integer); ok {
-				v, err := integer.Int()
-				if err != nil {
-					return nil, err
-				}
-				c.CSVHeaderRowCount = int(v)
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_skip_rows"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if integer, ok := kv.Value.(*ast.Integer); ok {
-				v, err := integer.Int()
-				if err != nil {
-					return nil, err
-				}
-				c.CSVSkipRows = int(v)
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_skip_columns"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if integer, ok := kv.Value.(*ast.Integer); ok {
-				v, err := integer.Int()
-				if err != nil {
-					return nil, err
-				}
-				c.CSVSkipColumns = int(v)
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["csv_trim_space"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.Boolean); ok {
-				//for config with no quotes
-				val, err := strconv.ParseBool(str.Value)
-				c.CSVTrimSpace = val
-				if err != nil {
-					return nil, fmt.Errorf("E! parsing to bool: %v", err)
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["form_urlencoded_tag_keys"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.FormUrlencodedTagKeys = append(c.FormUrlencodedTagKeys, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	c.MetricName = name
-
-	delete(tbl.Fields, "data_format")
-	delete(tbl.Fields, "separator")
-	delete(tbl.Fields, "templates")
-	delete(tbl.Fields, "tag_keys")
-	delete(tbl.Fields, "json_name_key")
-	delete(tbl.Fields, "json_query")
-	delete(tbl.Fields, "json_string_fields")
-	delete(tbl.Fields, "json_time_format")
-	delete(tbl.Fields, "json_time_key")
-	delete(tbl.Fields, "json_timezone")
-	delete(tbl.Fields, "json_strict")
-	delete(tbl.Fields, "data_type")
-	delete(tbl.Fields, "collectd_auth_file")
-	delete(tbl.Fields, "collectd_security_level")
-	delete(tbl.Fields, "collectd_typesdb")
-	delete(tbl.Fields, "collectd_parse_multivalue")
-	delete(tbl.Fields, "dropwizard_metric_registry_path")
-	delete(tbl.Fields, "dropwizard_time_path")
-	delete(tbl.Fields, "dropwizard_time_format")
-	delete(tbl.Fields, "dropwizard_tags_path")
-	delete(tbl.Fields, "dropwizard_tag_paths")
-	delete(tbl.Fields, "grok_named_patterns")
-	delete(tbl.Fields, "grok_patterns")
-	delete(tbl.Fields, "grok_custom_patterns")
-	delete(tbl.Fields, "grok_custom_pattern_files")
-	delete(tbl.Fields, "grok_timezone")
-	delete(tbl.Fields, "grok_unique_timestamp")
-	delete(tbl.Fields, "csv_column_names")
-	delete(tbl.Fields, "csv_column_types")
-	delete(tbl.Fields, "csv_comment")
-	delete(tbl.Fields, "csv_delimiter")
-	delete(tbl.Fields, "csv_field_columns")
-	delete(tbl.Fields, "csv_header_row_count")
-	delete(tbl.Fields, "csv_measurement_column")
-	delete(tbl.Fields, "csv_skip_columns")
-	delete(tbl.Fields, "csv_skip_rows")
-	delete(tbl.Fields, "csv_tag_columns")
-	delete(tbl.Fields, "csv_timestamp_column")
-	delete(tbl.Fields, "csv_timestamp_format")
-	delete(tbl.Fields, "csv_trim_space")
-	delete(tbl.Fields, "form_urlencoded_tag_keys")
-
-	return c, nil
+	return pc, nil
 }
 
 // buildSerializer grabs the necessary entries from the ast.Table for creating
 // a serializers.Serializer object, and creates it, which can then be added onto
 // an Output object.
-func buildSerializer(name string, tbl *ast.Table) (serializers.Serializer, error) {
-	c := &serializers.Config{TimestampUnits: time.Duration(1 * time.Second)}
+func (c *Config) buildSerializer(name string, tbl *ast.Table) (serializers.Serializer, error) {
+	sc := &serializers.Config{TimestampUnits: time.Duration(1 * time.Second)}
 
-	if node, ok := tbl.Fields["data_format"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.DataFormat = str.Value
-			}
-		}
+	c.getFieldString(tbl, "data_format", &sc.DataFormat)
+
+	if sc.DataFormat == "" {
+		sc.DataFormat = "influx"
 	}
 
-	if c.DataFormat == "" {
-		c.DataFormat = "influx"
+	c.getFieldString(tbl, "prefix", &sc.Prefix)
+	c.getFieldString(tbl, "template", &sc.Template)
+	c.getFieldStringSlice(tbl, "templates", &sc.Templates)
+	c.getFieldInt(tbl, "influx_max_line_bytes", &sc.InfluxMaxLineBytes)
+
+	c.getFieldBool(tbl, "influx_sort_fields", &sc.InfluxSortFields)
+	c.getFieldBool(tbl, "influx_uint_support", &sc.InfluxUintSupport)
+	c.getFieldBool(tbl, "graphite_tag_support", &sc.GraphiteTagSupport)
+	c.getFieldString(tbl, "graphite_separator", &sc.GraphiteSeparator)
+
+	c.getFieldDuration(tbl, "json_timestamp_units", &sc.TimestampUnits)
+
+	c.getFieldBool(tbl, "splunkmetric_hec_routing", &sc.HecRouting)
+	c.getFieldBool(tbl, "splunkmetric_multimetric", &sc.SplunkmetricMultiMetric)
+
+	c.getFieldStringSlice(tbl, "wavefront_source_override", &sc.WavefrontSourceOverride)
+
+	c.getFieldBool(tbl, "wavefront_use_strict", &sc.WavefrontUseStrict)
+	c.getFieldBool(tbl, "prometheus_export_timestamp", &sc.PrometheusExportTimestamp)
+	c.getFieldBool(tbl, "prometheus_sort_metrics", &sc.PrometheusSortMetrics)
+	c.getFieldBool(tbl, "prometheus_string_as_label", &sc.PrometheusStringAsLabel)
+
+	if c.hasErrs() {
+		return nil, c.firstErr()
 	}
 
-	if node, ok := tbl.Fields["prefix"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.Prefix = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["template"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.Template = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["templates"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.Templates = append(c.Templates, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["influx_max_line_bytes"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if integer, ok := kv.Value.(*ast.Integer); ok {
-				v, err := integer.Int()
-				if err != nil {
-					return nil, err
-				}
-				c.InfluxMaxLineBytes = int(v)
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["influx_sort_fields"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.InfluxSortFields, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["influx_uint_support"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.InfluxUintSupport, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["graphite_tag_support"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.GraphiteTagSupport, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["graphite_separator"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				c.GraphiteSeparator = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["json_timestamp_units"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				timestampVal, err := time.ParseDuration(str.Value)
-				if err != nil {
-					return nil, fmt.Errorf("Unable to parse json_timestamp_units as a duration, %s", err)
-				}
-				// now that we have a duration, truncate it to the nearest
-				// power of ten (just in case)
-				nearest_exponent := int64(math.Log10(float64(timestampVal.Nanoseconds())))
-				new_nanoseconds := int64(math.Pow(10.0, float64(nearest_exponent)))
-				c.TimestampUnits = time.Duration(new_nanoseconds)
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["splunkmetric_hec_routing"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.HecRouting, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["splunkmetric_multimetric"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.SplunkmetricMultiMetric, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["wavefront_source_override"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if ary, ok := kv.Value.(*ast.Array); ok {
-				for _, elem := range ary.Value {
-					if str, ok := elem.(*ast.String); ok {
-						c.WavefrontSourceOverride = append(c.WavefrontSourceOverride, str.Value)
-					}
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["wavefront_use_strict"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.WavefrontUseStrict, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["prometheus_export_timestamp"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.PrometheusExportTimestamp, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["prometheus_sort_metrics"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.PrometheusSortMetrics, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["prometheus_string_as_label"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if b, ok := kv.Value.(*ast.Boolean); ok {
-				var err error
-				c.PrometheusStringAsLabel, err = b.Boolean()
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	delete(tbl.Fields, "influx_max_line_bytes")
-	delete(tbl.Fields, "influx_sort_fields")
-	delete(tbl.Fields, "influx_uint_support")
-	delete(tbl.Fields, "graphite_tag_support")
-	delete(tbl.Fields, "graphite_separator")
-	delete(tbl.Fields, "data_format")
-	delete(tbl.Fields, "prefix")
-	delete(tbl.Fields, "template")
-	delete(tbl.Fields, "templates")
-	delete(tbl.Fields, "json_timestamp_units")
-	delete(tbl.Fields, "splunkmetric_hec_routing")
-	delete(tbl.Fields, "splunkmetric_multimetric")
-	delete(tbl.Fields, "wavefront_source_override")
-	delete(tbl.Fields, "wavefront_use_strict")
-	delete(tbl.Fields, "prometheus_export_timestamp")
-	delete(tbl.Fields, "prometheus_sort_metrics")
-	delete(tbl.Fields, "prometheus_string_as_label")
-	return serializers.NewSerializer(c)
+	return serializers.NewSerializer(sc)
 }
 
 // buildOutput parses output specific items from the ast.Table,
 // builds the filter and returns an
 // models.OutputConfig to be inserted into models.RunningInput
 // Note: error exists in the return for future calls that might require error
-func buildOutput(name string, tbl *ast.Table) (*models.OutputConfig, error) {
-	filter, err := buildFilter(tbl)
+func (c *Config) buildOutput(name string, tbl *ast.Table) (*models.OutputConfig, error) {
+	filter, err := c.buildFilter(tbl)
 	if err != nil {
 		return nil, err
 	}
@@ -2102,96 +1373,158 @@ func buildOutput(name string, tbl *ast.Table) (*models.OutputConfig, error) {
 		oc.Filter.NamePass = oc.Filter.FieldPass
 	}
 
-	if node, ok := tbl.Fields["flush_interval"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				dur, err := time.ParseDuration(str.Value)
-				if err != nil {
-					return nil, err
-				}
+	c.getFieldDuration(tbl, "flush_interval", &oc.FlushInterval)
+	c.getFieldDuration(tbl, "flush_jitter", oc.FlushJitter)
 
-				oc.FlushInterval = dur
-			}
-		}
+	c.getFieldInt(tbl, "metric_buffer_limit", &oc.MetricBufferLimit)
+	c.getFieldInt(tbl, "metric_batch_size", &oc.MetricBatchSize)
+	c.getFieldString(tbl, "alias", &oc.Alias)
+	c.getFieldString(tbl, "name_override", &oc.NameOverride)
+	c.getFieldString(tbl, "name_suffix", &oc.NameSuffix)
+	c.getFieldString(tbl, "name_prefix", &oc.NamePrefix)
+
+	if c.hasErrs() {
+		return nil, c.firstErr()
 	}
-
-	if node, ok := tbl.Fields["flush_jitter"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				dur, err := time.ParseDuration(str.Value)
-				if err != nil {
-					return nil, err
-				}
-				oc.FlushJitter = new(time.Duration)
-				*oc.FlushJitter = dur
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["metric_buffer_limit"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if integer, ok := kv.Value.(*ast.Integer); ok {
-				v, err := integer.Int()
-				if err != nil {
-					return nil, err
-				}
-				oc.MetricBufferLimit = int(v)
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["metric_batch_size"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if integer, ok := kv.Value.(*ast.Integer); ok {
-				v, err := integer.Int()
-				if err != nil {
-					return nil, err
-				}
-				oc.MetricBatchSize = int(v)
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["alias"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				oc.Alias = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_override"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				oc.NameOverride = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_suffix"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				oc.NameSuffix = str.Value
-			}
-		}
-	}
-
-	if node, ok := tbl.Fields["name_prefix"]; ok {
-		if kv, ok := node.(*ast.KeyValue); ok {
-			if str, ok := kv.Value.(*ast.String); ok {
-				oc.NamePrefix = str.Value
-			}
-		}
-	}
-
-	delete(tbl.Fields, "flush_interval")
-	delete(tbl.Fields, "flush_jitter")
-	delete(tbl.Fields, "metric_buffer_limit")
-	delete(tbl.Fields, "metric_batch_size")
-	delete(tbl.Fields, "alias")
-	delete(tbl.Fields, "name_override")
-	delete(tbl.Fields, "name_suffix")
-	delete(tbl.Fields, "name_prefix")
 
 	return oc, nil
+}
+
+func (c *Config) missingTomlField(typ reflect.Type, key string) error {
+	switch key {
+	case "interval", "tagpass", "tagdrop", "namepass", "namedrop", "name_suffix",
+		"fieldpass", "fielddrop", "pass", "drop", "taginclude", "tagexclude":
+	default:
+		c.UnusedFields[key] = true
+	}
+	return nil
+}
+
+func (c *Config) getFieldString(tbl *ast.Table, fieldName string, target *string) {
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if kv, ok := node.(*ast.KeyValue); ok {
+			if str, ok := kv.Value.(*ast.String); ok {
+				*target = str.Value
+			}
+		}
+	}
+}
+
+func (c *Config) getFieldDuration(tbl *ast.Table, fieldName string, target interface{}) {
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if kv, ok := node.(*ast.KeyValue); ok {
+			if str, ok := kv.Value.(*ast.String); ok {
+				d, err := time.ParseDuration(str.Value)
+				if err != nil {
+					c.errs = append(c.errs, fmt.Errorf("error parsing duration: %s", err))
+					return
+				}
+				targetVal := reflect.ValueOf(target).Elem()
+				targetVal.Set(reflect.ValueOf(d))
+			}
+		}
+	}
+}
+
+func (c *Config) getFieldBool(tbl *ast.Table, fieldName string, target *bool) {
+	var err error
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if kv, ok := node.(*ast.KeyValue); ok {
+			switch t := kv.Value.(type) {
+			case *ast.Boolean:
+				*target, err = t.Boolean()
+				if err != nil {
+					c.errs = append(c.errs, fmt.Errorf("unknown boolean value type %q, expecting boolean", kv.Value))
+					return
+				}
+			case *ast.String:
+				*target, err = strconv.ParseBool(t.Value)
+				if err != nil {
+					c.errs = append(c.errs, fmt.Errorf("unknown boolean value type %q, expecting boolean", kv.Value))
+					return
+				}
+			default:
+				c.errs = append(c.errs, fmt.Errorf("unknown boolean value type %q, expecting boolean", kv.Value.Source()))
+				return
+			}
+		}
+	}
+}
+
+func (c *Config) getFieldInt(tbl *ast.Table, fieldName string, target *int) {
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if kv, ok := node.(*ast.KeyValue); ok {
+			if iAst, ok := kv.Value.(*ast.Integer); ok {
+				i, err := iAst.Int()
+				if err != nil {
+					c.errs = append(c.errs, fmt.Errorf("unexpected int type %q, expecting int", iAst.Value))
+					return
+				}
+				*target = int(i)
+			}
+		}
+	}
+}
+
+func (c *Config) getFieldInt64(tbl *ast.Table, fieldName string, target *int64) {
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if kv, ok := node.(*ast.KeyValue); ok {
+			if iAst, ok := kv.Value.(*ast.Integer); ok {
+				i, err := iAst.Int()
+				if err != nil {
+					c.errs = append(c.errs, fmt.Errorf("unexpected int type %q, expecting int", iAst.Value))
+					return
+				}
+				*target = i
+			}
+		}
+	}
+}
+
+func (c *Config) getFieldStringSlice(tbl *ast.Table, fieldName string, target *[]string) {
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if kv, ok := node.(*ast.KeyValue); ok {
+			if ary, ok := kv.Value.(*ast.Array); ok {
+				for _, elem := range ary.Value {
+					if str, ok := elem.(*ast.String); ok {
+						*target = append(*target, str.Value)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (c *Config) getFieldStringMap(tbl *ast.Table, fieldName string, target *map[string]string) {
+	*target = map[string]string{}
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if subtbl, ok := node.(*ast.Table); ok {
+			for name, val := range subtbl.Fields {
+				if kv, ok := val.(*ast.KeyValue); ok {
+					if str, ok := kv.Value.(*ast.String); ok {
+						(*target)[name] = str.Value
+					}
+				}
+			}
+		}
+	}
+}
+
+func keys(m map[string]bool) []string {
+	result := []string{}
+	for k := range m {
+		result = append(result, k)
+	}
+	return result
+}
+
+func (c *Config) hasErrs() bool {
+	return len(c.errs) > 0
+}
+
+func (c *Config) firstErr() error {
+	if len(c.errs) == 0 {
+		return nil
+	}
+	return c.errs[0]
 }

@@ -207,7 +207,7 @@ func TestConfig_FieldNotDefined(t *testing.T) {
 	c := NewConfig()
 	err := c.LoadConfig("./testdata/invalid_field.toml")
 	require.Error(t, err, "invalid field name")
-	assert.Equal(t, "Error parsing ./testdata/invalid_field.toml, line 2: field corresponding to `not_a_field' is not defined in http_listener_v2.HTTPListenerV2", err.Error())
+	assert.Equal(t, "Error parsing ./testdata/invalid_field.toml: plugin inputs.http_listener_v2: Configuration specified the fields [\"not_a_field\"], but they weren't used.", err.Error())
 
 }
 
