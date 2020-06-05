@@ -29,10 +29,10 @@ func TestSimpleReverseLookup(t *testing.T) {
 			Dest: "dest_name",
 		},
 	}
-	acc := testutil.Accumulator{}
+	acc := &testutil.Accumulator{}
 	dns.Init()
-	dns.Start(&acc)
-	dns.Add(m)
+	dns.Start(acc)
+	dns.Add(m, acc)
 	dns.Stop()
 	// should be processed now.
 
