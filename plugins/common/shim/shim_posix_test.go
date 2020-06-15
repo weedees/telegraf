@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"io/ioutil"
 	"os"
 	"runtime"
 	"syscall"
@@ -51,13 +52,7 @@ func TestShimUSR1SignalingWorks(t *testing.T) {
 		}
 	}()
 
-	timeout := time.NewTimer(10 * time.Second)
-
-	select {
-	case <-metricProcessed:
-	case <-timeout.C:
-		require.Fail(t, "Timeout waiting for metric to arrive")
-	}
+	<-metricProcessed
 	cancel()
 
 	r := bufio.NewReader(stdoutReader)
@@ -66,5 +61,7 @@ func TestShimUSR1SignalingWorks(t *testing.T) {
 	require.Equal(t, "measurement,tag=tag field=1i 1234000005678\n", out)
 
 	stdinWriter.Close()
+	go ioutil.ReadAll(r)
+
 	<-exited
 }

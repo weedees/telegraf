@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"io/ioutil"
 	"strings"
 	"testing"
 	"time"
@@ -13,28 +14,17 @@ import (
 	"github.com/influxdata/telegraf"
 )
 
-func TestInputShim(t *testing.T) {
+func TestInputShimTimer(t *testing.T) {
 	stdoutBytes := bytes.NewBufferString("")
 	stdout = stdoutBytes
 
 	stdin, _ = io.Pipe() // hold the stdin pipe open
 
-	timeout := time.NewTimer(10 * time.Second)
 	metricProcessed, _ := runInputPlugin(t, 10*time.Millisecond)
 
-	select {
-	case <-metricProcessed:
-	case <-timeout.C:
-		require.Fail(t, "Timeout waiting for metric to arrive")
-	}
+	<-metricProcessed
 	for stdoutBytes.Len() == 0 {
-		select {
-		case <-timeout.C:
-			require.Fail(t, "Timeout waiting to read metric from stdout")
-			return
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	out := string(stdoutBytes.Bytes())
@@ -50,16 +40,11 @@ func TestInputShimStdinSignalingWorks(t *testing.T) {
 	stdin = stdinReader
 	stdout = stdoutWriter
 
-	timeout := time.NewTimer(10 * time.Second)
 	metricProcessed, exited := runInputPlugin(t, 40*time.Second)
 
 	stdinWriter.Write([]byte("\n"))
 
-	select {
-	case <-metricProcessed:
-	case <-timeout.C:
-		require.Fail(t, "Timeout waiting for metric to arrive")
-	}
+	<-metricProcessed
 
 	r := bufio.NewReader(stdoutReader)
 	out, err := r.ReadString('\n')
@@ -67,13 +52,14 @@ func TestInputShimStdinSignalingWorks(t *testing.T) {
 	require.Equal(t, "measurement,tag=tag field=1i 1234000005678\n", out)
 
 	stdinWriter.Close()
+	go ioutil.ReadAll(r)
 	// check that it exits cleanly
 	<-exited
 }
 
 func runInputPlugin(t *testing.T, interval time.Duration) (metricProcessed chan bool, exited chan bool) {
-	metricProcessed = make(chan bool)
-	exited = make(chan bool)
+	metricProcessed = make(chan bool, 1)
+	exited = make(chan bool, 1)
 	inp := &testInput{
 		metricProcessed: metricProcessed,
 	}
